@@ -1,0 +1,274 @@
+#define BLYNK_TEMPLATE_ID "Enter your Template ID"
+#define BLYNK_TEMPLATE_NAME "Enter your Template Name"
+#define BLYNK_AUTH_TOKEN "Enter your Auth Token code"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// OLED (SH1106 128x64)
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// Sensor Pins
+#define WATERLEVEL_PIN 32
+#define FLOW_PIN       26
+#define TURBIDITY_PIN  33
+#define TDS_PIN        35
+#define LM35_PIN       34
+#define PUMP_PIN       25
+
+// Flow Sensor
+volatile int flowPulseCount = 0;
+float flowRate = 0;
+unsigned long lastFlowTime = 0;
+
+// Thresholds
+int waterLowThreshold = 1500;
+
+// WiFi
+char ssid[] = "Enter your WIFI SSID";
+char pass[] = "Enter your WIFI password";
+
+// Sensor Value Strings
+String lastTemp = "NA", lastTDS = "NA", lastTurb = "NA", lastFlow = "NA", lastLevel = "NA";
+
+// Manual Pump Control
+BLYNK_WRITE(V5) {
+  digitalWrite(PUMP_PIN, param.asInt() ? HIGH : LOW);
+}
+
+// Flow Interrupt
+void IRAM_ATTR flowISR() {
+  flowPulseCount++;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowISR, RISING);
+
+  // Initialize OLED first
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(10, 30, "Smart Water System");
+  u8g2.sendBuffer();
+  delay(1500);
+
+  // Initialize Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  
+  Serial.println("System initialized");
+}
+
+int stableAnalogRead(int pin) {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  return sum / 10;
+}
+
+// Improved sensor detection logic
+bool isSensorConnected(int pin) {
+  // Take multiple readings to check for stability
+  int reading1 = stableAnalogRead(pin);
+  delay(100);
+  int reading2 = stableAnalogRead(pin);
+  delay(100);
+  int reading3 = stableAnalogRead(pin);
+  
+  Serial.print("Sensor check for pin ");
+  Serial.print(pin);
+  Serial.print(" - Readings: ");
+  Serial.print(reading1);
+  Serial.print(", ");
+  Serial.print(reading2);
+  Serial.print(", ");
+  Serial.println(reading3);
+  
+  // Check for reasonable range AND stability
+  int maxReading = max(max(reading1, reading2), reading3);
+  int minReading = min(min(reading1, reading2), reading3);
+  int variance = maxReading - minReading;
+  
+  // For floating pins, readings are usually very unstable and often at extremes
+  // Connected sensors should give more stable readings in a reasonable range
+  bool inRange = (reading1 > 200 && reading1 < 3800); // Avoid extreme values
+  bool stable = (variance < 100); // Readings should be relatively stable
+  
+  Serial.print("Range check: ");
+  Serial.print(inRange);
+  Serial.print(", Stability check (variance ");
+  Serial.print(variance);
+  Serial.print("): ");
+  Serial.println(stable);
+  
+  return inRange && stable;
+}
+
+// Special detection for LM35 temperature sensor
+bool isLM35Connected(int pin) {
+  int reading1 = stableAnalogRead(pin);
+  delay(100);
+  int reading2 = stableAnalogRead(pin);
+  
+  Serial.print("LM35 check for pin ");
+  Serial.print(pin);
+  Serial.print(" - Readings: ");
+  Serial.print(reading1);
+  Serial.print(", ");
+  Serial.println(reading2);
+  
+  float voltage1 = reading1 * (3.3 / 4095.0);
+  float voltage2 = reading2 * (3.3 / 4095.0);
+  float temp1 = voltage1 * 100.0;
+  float temp2 = voltage2 * 100.0;
+  
+  // LM35 should give reasonable temperature readings (0-50°C typical)
+  // and should be relatively stable
+  bool reasonableTemp = (temp1 > 0 && temp1 < 60 && temp2 > 0 && temp2 < 60);
+  bool stable = (abs(temp1 - temp2) < 5.0); // Within 5°C difference
+  
+  Serial.print("Temperature check: ");
+  Serial.print(temp1);
+  Serial.print("°C, ");
+  Serial.print(temp2);
+  Serial.print("°C, Reasonable: ");
+  Serial.print(reasonableTemp);
+  Serial.print(", Stable: ");
+  Serial.println(stable);
+  
+  return reasonableTemp && stable;
+}
+
+void readSensors() {
+  // ===== Temperature with Special Detection =====
+  if (isLM35Connected(LM35_PIN)) {
+    int tempRaw = stableAnalogRead(LM35_PIN);
+    float voltage = tempRaw * (3.3 / 4095.0);
+    float tempC = voltage * 100.0;
+    
+    Serial.print("LM35 Connected - Raw: ");
+    Serial.print(tempRaw);
+    Serial.print(", Voltage: ");
+    Serial.print(voltage, 3);
+    Serial.print("V, Temperature: ");
+    Serial.println(tempC);
+    
+    lastTemp = String(tempC, 1);
+    Blynk.virtualWrite(V0, tempC);
+  } else {
+    Serial.println("LM35 temperature sensor not detected or readings invalid");
+    lastTemp = "NA";
+    Blynk.virtualWrite(V0, "Not Connected");
+  }
+
+  // ===== TDS =====
+  if (isSensorConnected(TDS_PIN)) {
+    int rawValue = stableAnalogRead(TDS_PIN);
+    float voltage = rawValue * (3.3 / 4095.0);
+    float tds = (133.42 * voltage * voltage * voltage)
+              - (255.86 * voltage * voltage)
+              + (857.39 * voltage) * 0.5;
+    
+    if (tds >= 0 && tds <= 5000) {
+      lastTDS = String(tds, 1);
+      Blynk.virtualWrite(V1, tds);
+    } else {
+      lastTDS = "NA";
+      Blynk.virtualWrite(V1, "Sensor Error");
+    }
+  } else {
+    lastTDS = "NA";
+    Blynk.virtualWrite(V1, "Not Connected");
+  }
+
+  // ===== Turbidity =====
+  if (isSensorConnected(TURBIDITY_PIN)) {
+    int turbidity = stableAnalogRead(TURBIDITY_PIN);
+    lastTurb = String(turbidity);
+    Blynk.virtualWrite(V2, turbidity);
+  } else {
+    lastTurb = "NA";
+    Blynk.virtualWrite(V2, "Not Connected");
+  }
+
+  // ===== Flow Sensor =====
+  unsigned long now = millis();
+  if (now - lastFlowTime >= 1000) {
+    noInterrupts();
+    int pulseCount = flowPulseCount;
+    flowPulseCount = 0;
+    interrupts();
+    
+    flowRate = pulseCount / 7.5;
+    lastFlowTime = now;
+
+    if (flowRate > 0.01) {
+      lastFlow = String(flowRate, 2);
+      Blynk.virtualWrite(V3, flowRate);
+    } else {
+      lastFlow = "0.00";
+      Blynk.virtualWrite(V3, 0);
+    }
+  }
+
+  // ===== Water Level =====
+  if (isSensorConnected(WATERLEVEL_PIN)) {
+    int levelRaw = stableAnalogRead(WATERLEVEL_PIN);
+    Serial.print("Water level sensor detected - Raw value: ");
+    Serial.println(levelRaw);
+    
+    lastLevel = String(levelRaw);
+    Blynk.virtualWrite(V4, levelRaw);
+    
+    // Auto Pump Control
+    if (levelRaw < waterLowThreshold) {
+      digitalWrite(PUMP_PIN, HIGH);
+      Blynk.virtualWrite(V5, 1);
+      Serial.println("Pump ON - Low water level");
+    } else {
+      digitalWrite(PUMP_PIN, LOW);
+      Blynk.virtualWrite(V5, 0);
+      Serial.println("Pump OFF - Adequate water level");
+    }
+  } else {
+    Serial.println("Water level sensor not detected");
+    lastLevel = "NA";
+    Blynk.virtualWrite(V4, "Not Connected");
+    digitalWrite(PUMP_PIN, LOW);
+    Blynk.virtualWrite(V5, 0);
+  }
+
+  // ===== OLED Display =====
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tr);
+  
+  String tempStr = "Temp: " + lastTemp + (lastTemp != "NA" ? "C" : "");
+  String tdsStr = "TDS:  " + lastTDS + (lastTDS != "NA" ? "ppm" : "");
+  String turbStr = "Turb: " + lastTurb;
+  String flowStr = "Flow: " + lastFlow + (lastFlow != "NA" && lastFlow != "0.00" ? "L/m" : "");
+  String levelStr = "Level:" + lastLevel;
+  
+  u8g2.drawStr(0, 10, tempStr.c_str());
+  u8g2.drawStr(0, 22, tdsStr.c_str());
+  u8g2.drawStr(0, 34, turbStr.c_str());
+  u8g2.drawStr(0, 46, flowStr.c_str());
+  u8g2.drawStr(0, 58, levelStr.c_str());
+  u8g2.sendBuffer();
+  
+  Serial.println("-------------------");
+}
+
+void loop() {
+  Blynk.run();
+  readSensors();
+  delay(1000); // Increased delay for better stability checking
+}
