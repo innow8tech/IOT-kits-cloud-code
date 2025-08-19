@@ -1,0 +1,203 @@
+// ---- Blynk Credentials ----
+#define BLYNK_TEMPLATE_ID "TMPL3zzE2D_LR"
+#define BLYNK_TEMPLATE_NAME "IOT Biomedical HUB"
+#define BLYNK_AUTH_TOKEN "bLTU6l3EOCf4pcBj697mzs78JWdvlcc4"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+MAX30105 particleSensor;
+
+// ---- WiFi ----
+char ssid[] = "INNOW8A12";
+char pass[] = "Innow8@A12";
+
+// ---- OLED ----
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ---- I2C Addresses ----
+#define TEMP_SENSOR_ADDR    0x33
+#define SMOKE_SENSOR_ADDR   0x42
+#define ALCOHOL_SENSOR_ADDR 0x41
+
+// ---- Pulse Sensor Averaging ----
+#define MAX_BPM_SAMPLES 8
+int bpmSamples[MAX_BPM_SAMPLES];
+int bpmIndex = 0;
+long lastBeat = 0;
+float bpm = 0;
+bool fingerDetected = false;
+
+// ---- Sensor Data ----
+int temp = 0, smoke = 0, alcohol = 0;
+
+// ---- Timers ----
+BlynkTimer timer;
+unsigned long lastOledUpdate = 0;
+const unsigned long oledInterval = 1000;
+
+// ---- Function Prototypes ----
+int readTemperature();
+int readSmoke();
+int readAlcohol();
+int readPulse();
+void updateDisplay();
+
+// ---- SETUP ----
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22); // Explicit pins for ESP32
+  u8g2.begin();
+
+  // Boot Screen
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.clearBuffer();
+  u8g2.drawStr(20, 32, "Biomedical Kit");
+  u8g2.sendBuffer();
+  delay(1200);
+
+  // WiFi + Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // MAX30102 INIT with optimized settings
+  if (particleSensor.begin(Wire, I2C_SPEED_STANDARD, 0x57)) {
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x7F); // Stronger LED
+    particleSensor.setPulseAmplitudeIR(0x7F);
+    particleSensor.setSampleRate(200);         // Better HR detection
+    particleSensor.setFIFOAverage(4);
+    Serial.println("MAX30102 initialized successfully!");
+  } else {
+    Serial.println("MAX30102 not found. Check wiring and power!");
+    while (1);
+  }
+
+  for (int i = 0; i < MAX_BPM_SAMPLES; i++) bpmSamples[i] = 0;
+
+  // Blynk update timer
+  timer.setInterval(3000L, []() {
+    temp = readTemperature();
+    smoke = readSmoke();
+    int pulseVal = readPulse();
+    alcohol = readAlcohol();
+
+    // Send data to Blynk
+    Blynk.virtualWrite(V0, temp);
+    Blynk.virtualWrite(V1, smoke);
+    Blynk.virtualWrite(V2, pulseVal);
+    Blynk.virtualWrite(V3, alcohol);
+
+    // Debug Serial Print
+    Serial.println("----- Sensor Data -----");
+    Serial.print("Temperature: "); Serial.println(temp);
+    Serial.print("Smoke: "); Serial.println(smoke);
+    Serial.print("Pulse: "); Serial.println(pulseVal);
+    Serial.print("Alcohol: "); Serial.println(alcohol);
+    Serial.println("-----------------------");
+
+    // Alerts
+    if (temp > 39) Blynk.logEvent("high_fever", "High Fever Detected!");
+    if (smoke > 500) Blynk.logEvent("smoke_alert", "Smoke Detected!");
+    if (alcohol > 250) Blynk.logEvent("alcohol_alert", "Danger Alcohol Level!");
+  });
+}
+
+// ---- LOOP ----
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  if (millis() - lastOledUpdate >= oledInterval) {
+    lastOledUpdate = millis();
+    updateDisplay();
+  }
+}
+
+// ---- OLED DISPLAY ----
+void updateDisplay() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr);
+
+  // Box Layout
+  u8g2.drawFrame(0, 0, 128, 64);
+
+  // Title Row
+  u8g2.drawStr(30, 10, "BioMedical HUB");
+
+  // Sensor Values neatly aligned
+  u8g2.drawStr(4, 22, ("Temp    : " + String(temp) + " C").c_str());
+  u8g2.drawStr(4, 34, ("Smoke   : " + String(smoke)).c_str());
+
+  if (fingerDetected) {
+    u8g2.drawStr(4, 46, ("Pulse   : " + String((int)bpm) + " BPM").c_str());
+  } else {
+    u8g2.drawStr(4, 46, "Pulse   : Place Finger");
+  }
+
+  u8g2.drawStr(4, 58, ("Alcohol : " + String(alcohol)).c_str());
+
+  u8g2.sendBuffer();
+}
+
+// ---- SENSOR READ FUNCTIONS ----
+int readTemperature() {
+  Wire.requestFrom(TEMP_SENSOR_ADDR, 2);
+  if (Wire.available() >= 2) {
+    uint16_t val = Wire.read() << 8 | Wire.read();
+    return val / 10;
+  }
+  return 0;
+}
+
+int readSmoke() {
+  Wire.requestFrom(SMOKE_SENSOR_ADDR, 2);
+  if (Wire.available() >= 2) return Wire.read() << 8 | Wire.read();
+  return 0;
+}
+
+int readPulse() {
+  long irValue = particleSensor.getIR();
+  Serial.print("IR: "); Serial.println(irValue);
+
+  if (irValue > 5000) {  // lowered threshold
+    fingerDetected = true;
+    if (checkForBeat(irValue)) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+
+      if (delta > 0) {
+        float currentBPM = 60000.0 / delta;
+        if (currentBPM > 35 && currentBPM < 180) {
+          bpmSamples[bpmIndex++] = (int)currentBPM;
+          if (bpmIndex >= MAX_BPM_SAMPLES) bpmIndex = 0;
+
+          int sum = 0, validSamples = 0;
+          for (int i = 0; i < MAX_BPM_SAMPLES; i++) {
+            if (bpmSamples[i] > 0) {
+              sum += bpmSamples[i];
+              validSamples++;
+            }
+          }
+          bpm = validSamples > 0 ? (float)sum / validSamples : bpm;
+          Serial.print("BPM: ");
+          Serial.println(bpm);
+        }
+      }
+    }
+  } else {
+    fingerDetected = false;
+    bpm = 0; // just reset displayed BPM
+    Serial.println("No finger detected.");
+  }
+  return (int)bpm;
+}
+
+int readAlcohol() {
+  Wire.requestFrom(ALCOHOL_SENSOR_ADDR, 2);
+  if (Wire.available() >= 2) return Wire.read() << 8 | Wire.read();
+  return 0;
+}
